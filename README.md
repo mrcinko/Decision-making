@@ -1,2 +1,2 @@
 # Decision-making
-Decision-making exam
+Includes the code, plots and the dataset used for the Decision-making exam. 
