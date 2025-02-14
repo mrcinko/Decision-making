@@ -1,0 +1,286 @@
+---
+title: "predictive_checks"
+output: html_document
+date: "2025-02-12"
+---
+
+```{r setup, include=FALSE}
+install.packages("pacman")
+pacman::p_load(R2jags, parallel, ggplot2)
+
+set.seed(2001)
+
+### NB! Don't forget to set your working directory
+setwd("/work/MartinMikula#4870") 
+
+# defining a function for calculating the maximum of the posterior density (not exactly the same as the mode)
+MPD <- function(x) {
+  density(x)$x[which(density(x)$y==max(density(x)$y))]
+}
+
+
+
+#load data
+ctr_data <- read.csv("/work/MartinMikula#4870/horstmann_data.csv", header=TRUE)
+
+#----------prepare data for jags models - want trial x subject arrays for choice and gain & loss ----
+# identify and count unique subject IDs
+subIDs <- unique(ctr_data$subjID)
+nsubs <- length(subIDs)
+ntrials_max <- 100
+
+# all choices (x) and outcomes (X)
+x_raw <- ctr_data$deck
+X_raw <- ctr_data$gain + ctr_data$loss #note the sign!
+
+#--- assign choices and outcomes in trial x sub matrix
+
+#different number of trials across subjects. We'll need to fix this by padding arrays of < 100
+#this is just so we can make the array
+#then we'll also need to record number of valid trials for each sub, 
+#then run the JAGS model on only valid trials
+
+ntrials_all <- array(0, c(nsubs))
+x_all <- array(0, c(nsubs, ntrials_max))
+X_all <- array(0, c(nsubs, ntrials_max))
+
+for (s in 1:nsubs) {
+  
+  # Record n trials for subject s
+  ntrials_all[s] <- length(x_raw[ctr_data$subjID == subIDs[s]])
+  
+  # Pad trials with NA if n trials < maximum (i.e. 100)
+  x_sub <- x_raw[ctr_data$subjID == subIDs[s]]
+  length(x_sub) <- ntrials_max
+  
+  X_sub <- X_raw[ctr_data$subjID == subIDs[s]]
+  length(X_sub) <- ntrials_max
+  
+  # Implement the correct reversal learning structure
+  for (t in 51:100) {
+  if (x_sub[t] == 1) {  
+    X_sub[t] <- X_sub[t-50]  # A takes C's structure
+  } else if (x_sub[t] == 2) {  
+    X_sub[t] <- X_sub[t-50]  # B takes D's structure
+  } else if (x_sub[t] == 3) {  
+    X_sub[t] <- X_sub[t-50]  # C takes A's structure
+  } else if (x_sub[t] == 4) {  
+    X_sub[t] <- X_sub[t-50]  # D takes B's structure
+  }
+}
+
+  
+  # Assign arrays
+  x_all[s,] <- x_sub
+  X_all[s,] <- X_sub
+}
+
+# Scaling the payoffs (cuz the learning parameter becomes less relevant for very large payoffs/losses)
+X_all <- X_all/1000
+
+#----------testing our data curation by running JAGS on one subject
+
+# Now we'll fit one subject just to make sure everything works
+
+x <- x_all[1,]
+X <- X_all[1,]
+
+ntrials <- ntrials_all[1]
+
+# set up jags and run jags model on one subject
+data <- list("x","X","ntrials") 
+params<-c("a_rew","a_pun","K","theta","omega_f","omega_p","p")
+temp_samples <- jags(data, inits=NULL, params,
+                model.file ="ORL.txt",
+                n.chains=3, n.iter=5000, n.burnin=1000, n.thin=1)
+
+# let's look at the posteriors for the parameters
+par(mfrow=c(3,2))
+plot(density(temp_samples$BUGSoutput$sims.list$a_rew), 
+     main="a_rew: Reward Learning Rate")
+plot(density(temp_samples$BUGSoutput$sims.list$a_pun), 
+     main="a_pun: Punishment Learning Rate")
+plot(density(temp_samples$BUGSoutput$sims.list$theta), 
+     main="Theta: Noise")
+plot(density(temp_samples$BUGSoutput$sims.list$K), 
+     main="K: Perseveration")
+plot(density(temp_samples$BUGSoutput$sims.list$omega_f), 
+     main="Omega_f: Win/Loss Weight")
+plot(density(temp_samples$BUGSoutput$sims.list$omega_p), 
+     main="Omega_p: Perseverance Weight")
+
+```
+
+
+```{r setup, include=FALSE}
+# Question: how would you expect the data to look on the basis of these posteriors?
+
+
+#----------Posterior predictive checks of descriptive accuracy
+
+# Posterior prediction - start by looking at posteriors for p parameter
+
+p_post <- temp_samples$BUGSoutput$sims.list$p # probabilities as the outcome from softmax
+
+#plot probability of each deck on trial 91 - later ,because of the twist 
+par(mfrow=c(2,2))
+plot(density(p_post[,91,1]), main="Posterior Density: Deck A, Trial 91")
+plot(density(p_post[,91,2]), main="Posterior Density: Deck B, Trial 91")
+plot(density(p_post[,91,3]), main="Posterior Density: Deck C, Trial 91")
+plot(density(p_post[,91,4]), main="Posterior Density: Deck D, Trial 91")
+
+```
+
+
+```{r setup, include=FALSE}
+# which option will be chosen?
+x[84]
+# is this a good prediction?
+
+# let's write a loop that loop and see how the model goes at predicting responses for all trials 
+x_predict <- array(ntrials)
+
+for (t in 1:ntrials) {
+  
+  p_predict <- c(
+    MPD(p_post[,t,1]),
+    MPD(p_post[,t,2]),
+    MPD(p_post[,t,3]),
+    MPD(p_post[,t,4])
+  )
+  
+  x_predict[t] <- which.max(p_predict)
+}
+# how well did our model do?
+sum(x_predict==x)
+
+# let's see how the model goes for more than 1 subject. Let's run this on all subjects
+pred_success <- array(nsubs)
+
+start_time = Sys.time()
+
+for (s in 1:nsubs) {
+  
+  x <- x_all[s, ]
+  X <- X_all[s, ]
+  
+  ntrials <- ntrials_all[s]
+  
+  # set up jags and run jags model on one subject
+  data <- list("x","X","ntrials") 
+  params<-c("a_rew","a_pun","K","theta","omega_f","omega_p","p")
+  temp_samples <- jags.parallel(data, inits=NULL, params,
+                                model.file ="ORL.txt",
+                                n.chains=3, n.iter=5000, n.burnin=1000, n.thin=1, n.cluster=3)
+  
+  p_post <- temp_samples$BUGSoutput$sims.list$p
+  
+  x_predict <- array(ntrials)
+  
+  for (t in 1:ntrials) {
+    p_predict <- c(
+      MPD(p_post[,t,1]),
+      MPD(p_post[,t,2]),
+      MPD(p_post[,t,3]),
+      MPD(p_post[,t,4])
+    )
+    
+    x_predict[t] <- which.max(p_predict)
+    
+  }
+  
+  pred_success[s] <- sum(x_predict==x[1:ntrials]) # only comparing with trials for which we have choices
+  print(s)
+  
+}
+
+end_time = Sys.time()
+end_time - start_time
+
+pred_success_adjust <- pred_success/ntrials_all
+
+avg_pred <- mean(pred_success_adjust)
+print(avg_pred)
+```
+
+
+```{r setup, include=FALSE}
+# plotting code courtesy of Mia
+pred_df <- data.frame(pred_success_adjust)
+pred_df$sub <- 1:length(pred_success_adjust) # rownames(pred_df) # creating a subject index
+pred_df$avg <- mean(pred_df$pred_success)
+pred_df$std <- sd(pred_df$pred_success)
+pred_df$chance <- .25
+ggplot(pred_df, aes(sub, pred_success_adjust)) +
+  geom_point() +
+  geom_line(aes(y=chance), linetype="dashed", color = "black") +
+  geom_ribbon(aes(xmin = -Inf, xmax = Inf, ymin = avg - std, ymax = avg + std), fill = "pink", alpha = 0.6) + 
+  geom_line(aes(y=avg)) + 
+  ylim(0,1)
+
+average(pred_success_adjust)
+```
+
+
+```{r setup, include=FALSE}
+avg_p <- apply(p_post, c(2,3), mean)  # Average probabilities per trial per deck
+matplot(avg_p, type="l", lty=1, col=1:4, xlab="Trial", ylab="Choice Probability")
+legend("topright", legend=c("A", "B", "C", "D"), col=1:4, lty=1)
+
+plot(cumsum(X_all[1,]), type="l", xlab="Trial", ylab="Cumulative Reward")
+abline(v=50, col="blue", lty=2)  # Marks the twist at trial 50
+```
+
+
+```{r setup, include=FALSE}
+# Convert prediction accuracy to percentage
+pred_df$pred_success_percent <- pred_df$pred_success_adjust * 100
+pred_df$avg_percent <- mean(pred_df$pred_success_percent)
+pred_df$std_percent <- sd(pred_df$pred_success_percent)
+pred_df$chance_percent <- 25  # Chance level in %
+
+# Generate the plot
+ggplot(pred_df, aes(x = sub, y = pred_success_percent)) +
+  geom_point() +
+  geom_line(aes(y = chance_percent), linetype = "dashed", color = "black") +
+  geom_ribbon(aes(xmin = -Inf, xmax = Inf, ymin = avg_percent - std_percent, ymax = avg_percent + std_percent), 
+              fill = "pink", alpha = 0.6) + 
+  geom_line(aes(y = avg_percent)) + 
+  ylim(0, 100) +
+  labs(x = "Participant", y = "Prediction Accuracy (%)", title = "Prediction Accuracy Across Participants") +
+  theme_minimal()
+```
+
+
+```{r setup, include=FALSE}
+# Compute summary statistics for each parameter
+param_summary <- function(samples) {
+  mean_val <- mean(samples)
+  sd_val <- sd(samples)
+  ci <- quantile(samples, probs = c(0.025, 0.975)) # 95% credible interval
+  return(c(mean = mean_val, sd = sd_val, ci_lower = ci[1], ci_upper = ci[2]))
+}
+
+# Apply summary function to each parameter
+summary_table <- data.frame(
+  a_rew = param_summary(temp_samples$BUGSoutput$sims.list$a_rew),
+  a_pun = param_summary(temp_samples$BUGSoutput$sims.list$a_pun),
+  K = param_summary(temp_samples$BUGSoutput$sims.list$K),
+  theta = param_summary(temp_samples$BUGSoutput$sims.list$theta),
+  omega_f = param_summary(temp_samples$BUGSoutput$sims.list$omega_f),
+  omega_p = param_summary(temp_samples$BUGSoutput$sims.list$omega_p)
+)
+
+# Transpose for better readability
+summary_table <- t(summary_table)
+colnames(summary_table) <- c("Mean", "SD", "2.5% CI", "97.5% CI")
+
+# Print summary table
+print(summary_table)
+
+```
+
+```{r}
+
+```
+

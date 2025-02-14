@@ -1,0 +1,771 @@
+---
+title: "Decision-making"
+author: "Martin Mikula"
+date: "07.01.2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+install.packages("pacman")
+pacman::p_load(extraDistr,parallel, ggpubr,dplyr, ggplot2, rjags, R2jags)
+install.packages("R2jags")
+install.packages("rjags")
+library(extraDistr)
+library(ggplot2)
+
+
+# Loading the data
+setwd("C:/Users/marti/Desktop/Decision-making Exam/Data") 
+
+datas <- readRDS("Preprocessed/IGT_all_studies.rds")
+
+#View(data)
+
+
+# 1 study 
+single_data <- datas[datas$Study == "Horstmann",] 
+# Check structure
+str(single_data)
+
+# Load the Horstmann dataset
+horstmann_data <- read.csv("C:/Users/marti/Desktop/horstmann_data_semicolon.csv" ,sep = ";", header = TRUE, stringsAsFactors = FALSE)
+
+
+
+
+```
+
+```{r}
+### ORL RECOVERY 
+
+#payoff structure 
+#------ create task environment -------------------
+set.seed(2001)
+
+# defining a function for calculating the maximum of the posterior density (not exactly the same as the mode)
+MPD <- function(x) {
+  density(x)$x[which(density(x)$y==max(density(x)$y))]
+}
+
+# --- Define Parameters ---
+ntrials <- 100  # Total number of trials
+nstruct <- 10   # Subdivision size for pseudorandomization
+freq <- 0.5     # Probability of frequent losses
+infreq <- 0.1   # Probability of infrequent losses
+
+# Payoff values
+bad_r <- 100
+bad_freq_l <- -250
+bad_infreq_l <- -1250
+good_r <- 50
+good_freq_l <- -50
+good_infreq_l <- -250
+
+# --- Define Payoff Structures ---
+# Bad Frequent (Deck A)
+A_R <- rep(bad_r, nstruct)
+A_L <- c(rep(bad_freq_l, nstruct*freq), rep(0, nstruct*(1-freq)))
+
+# Bad Infrequent (Deck B)
+B_R <- rep(bad_r, nstruct)
+B_L <- c(rep(bad_infreq_l, nstruct*infreq), rep(0, nstruct*(1-infreq)))
+
+# Good Frequent (Deck C)
+C_R <- rep(good_r, nstruct)
+C_L <- c(rep(good_freq_l, nstruct*freq), rep(0, nstruct*(1-freq)))
+
+# Good Infrequent (Deck D)
+D_R <- rep(good_r, nstruct)
+D_L <- c(rep(good_infreq_l, nstruct*infreq), rep(0, nstruct*(1-infreq)))
+
+# --- Generate Pseudorandomized Payoffs ---
+A <- array(NA, ntrials)
+B <- array(NA, ntrials)
+C <- array(NA, ntrials)
+D <- array(NA, ntrials)
+
+for (i in 1:(ntrials/nstruct)) {
+  start_idx <- (1 + (i-1) * nstruct)
+  end_idx <- i * nstruct
+  
+  A[start_idx:end_idx] <- (A_R + sample(A_L))
+  B[start_idx:end_idx] <- (B_R + sample(B_L))
+  C[start_idx:end_idx] <- (C_R + sample(C_L))
+  D[start_idx:end_idx] <- (D_R + sample(D_L))
+}
+
+# --- Combine Payoffs into Matrix ---
+payoff <- cbind(A, B, C, D)
+
+# --- Swap Payoffs After Trial 50 ---
+payoff[51:100, 1] <- C[51:100]  # A takes C's structure
+payoff[51:100, 2] <- D[51:100]  # B takes D's structure
+payoff[51:100, 3] <- A[51:100]  # C takes A's structure
+payoff[51:100, 4] <- B[51:100]  # D takes B's structure
+# let's look at the payoff
+#colSums(payoff) # the two bad decks should sum to -25 (i.e. -2500), and the two good ones to 25 (i.e. 2500
+
+a_rew <- .3
+a_pun <- .3
+K <- 2
+theta <- 2
+omega_f <- .7
+omega_p <- .7
+
+# ntrials <- 100
+
+# Source your ORL simulation (aka. agent)
+source("ORL.R")
+
+# Run the simulations
+ORL_sims <- ORL(payoff,ntrials,a_rew,a_pun,K,theta,omega_f,omega_p)
+
+# Plotting to check that simulations make sense
+par(mfrow=c(2,2))
+plot(ORL_sims$Ev[,1])
+plot(ORL_sims$Ev[,2])
+plot(ORL_sims$Ev[,3])
+plot(ORL_sims$Ev[,4])
+
+# Re-assigning sim variables to the corresponding variable names in JAGS
+x <- ORL_sims$x
+X <- ORL_sims$X
+
+# set up jags and run jags model
+# What's our "data"
+data <- list("x","X","ntrials") 
+
+# What's our "parameters"
+params <- c("a_rew","a_pun","K","theta","omega_f","omega_p")
+
+# How to call jags?
+samples <- jags.parallel(data, inits=NULL, params,
+                model.file ="ORL.txt", n.chains=3, 
+                n.iter=5000, n.burnin=1000, n.thin=1, n.cluster=3)
+
+
+###--------------Run full parameter recovery -------------
+# How many iterations?
+niterations <- 100 # fewer because it takes too long
+
+# Which arrays to pre-specify for populating thru the iterations?
+true_a_rew <- array(NA,c(niterations))
+true_a_pun <- array(NA,c(niterations))
+true_K <- array(NA,c(niterations))
+true_theta <- array(NA,c(niterations))
+true_omega_f <- array(NA,c(niterations))
+true_omega_p <- array(NA,c(niterations))
+
+infer_a_rew <- array(NA,c(niterations))
+infer_a_pun <- array(NA,c(niterations))
+infer_K <- array(NA,c(niterations))
+infer_theta <- array(NA,c(niterations))
+infer_omega_f <- array(NA,c(niterations))
+infer_omega_p <- array(NA,c(niterations))
+
+# Let's run the show
+start_time = Sys.time()
+
+for (i in 1:niterations) {
+  
+  # What's our first step on each iteration? (hint: it rhymes with 'diameters')
+  a_rew <- runif(1,0,1)
+  a_pun <- runif(1,0,1)
+  K <- runif(1,0,2)
+  theta <- runif(1,.2,3) # could also just be a set value (e.g. 1) to simplify the model a bit
+  omega_f <- runif(1,-2,2)
+  omega_p <- runif(1,-2,2)
+  
+  # And then? (hint: it's not real data)
+  ORL_sims <- ORL(payoff,ntrials,a_rew,a_pun,K,theta,omega_f,omega_p)
+  
+  # Let's re-assign that into variables that match the corresponding variable names in our JAGS syntax
+  x <- ORL_sims$x
+  X <- ORL_sims$X
+  
+  # Final step? (hint: it rhymes with swags - also, look up - you just did this for 1 run)
+  data <- list("x","X","ntrials") 
+  params<-c("a_rew","a_pun","K","theta","omega_f","omega_p")
+  samples <- jags.parallel(data, inits=NULL, params,
+                  model.file ="ORL.txt", n.chains=3, 
+                  n.iter=3000, n.burnin=1000, n.thin=1, n.cluster=3)
+  
+  # populate the pre-specified arrays
+  true_a_rew[i] <- a_rew
+  true_a_pun[i] <- a_pun
+  true_K[i] <- K
+  true_theta[i] <- theta
+  true_omega_f[i] <- omega_f
+  true_omega_p[i] <- omega_p
+  
+  # some of the values requires finding the maximum a posteriori
+  Y <- samples$BUGSoutput$sims.list
+  infer_a_rew[i] <- MPD(Y$a_rew)
+  infer_a_pun[i] <- MPD(Y$a_pun)
+  infer_K[i] <- MPD(Y$K)
+  infer_theta[i] <- MPD(Y$theta)
+  infer_omega_f[i] <- MPD(Y$omega_f)
+  infer_omega_p[i] <- MPD(Y$omega_p)
+  
+  # Printing "progress"
+  print(i)
+  
+}
+
+# So how long did that take us?
+end_time = Sys.time()
+end_time - start_time
+
+
+```
+
+```{r}
+# let's look at some scatter plots (adjust variable names if you haven't used exactly the ones I've listed below here)
+
+par(mfrow=c(3,2))
+plot(true_a_rew,infer_a_rew)
+plot(true_a_pun,infer_a_pun)
+plot(true_K,infer_K)
+plot(true_theta,infer_theta)
+plot(true_omega_f,infer_omega_f)
+plot(true_omega_p,infer_omega_p)
+
+# plotting code courtesy of Lasse (again, check that the variable names correspond to yours)
+source('C:/Users/marti/Desktop/Decision-making Exam/recov_plot.R')
+pl1 <- recov_plot(true_a_rew, infer_a_rew, c("true a_rew", "infer a_rew"), 'smoothed linear fit')
+pl2 <- recov_plot(true_a_pun, infer_a_pun, c("true a_pun", "infer a_pun"), 'smoothed linear fit')
+pl3 <- recov_plot(true_K, infer_K, c("true K", "infer K"), 'smoothed linear fit')
+pl4 <- recov_plot(true_theta, infer_theta, c("true theta", "infer theta"), 'smoothed linear fit')
+pl5 <- recov_plot(true_omega_f, infer_omega_f, c("true omega_f", "infer omega_f"), 'smoothed linear fit')
+pl6 <- recov_plot(true_omega_p, infer_omega_p, c("true omega_p", "infer omega_p"), 'smoothed linear fit')
+ggarrange(pl1, pl2, pl3, pl4, pl5, pl6)
+```
+
+
+```{r}
+####ORL.R - actual ORL model simulating decision-amking 
+
+ORL <- function(payoff,ntrials,a_rew,a_pun,K,theta,omega_f,omega_p) {
+
+  # arrays to populate for simulation
+  x <- array(NA,c(ntrials))
+  X <- array(NA,c(ntrials))
+
+  Ev_update <- array(NA,c(ntrials,4))
+  Ev <- array(NA,c(ntrials,4))
+    
+  signX <- array(NA,c(ntrials))
+  Ef_cho <- array(NA,c(ntrials,4))
+  Ef_not <- array(NA,c(ntrials,4))
+  Ef <- array(NA,c(ntrials,4))
+  
+  PS <- array(NA,c(ntrials,4))
+  
+  V <- array(NA,c(ntrials,4))
+  
+  exp_p <- array(NA,c(ntrials,4))
+  p <- array(NA,c(ntrials,4))
+  
+  # free parameters - "turn on" when constructing
+  #a_rew <- .3
+  #a_pun <- .3
+  #K <- 3
+  #theta <- 3
+  #omega_f <- .7
+  #omega_p <- .7
+  
+  x[1] <- rcat(1,c(.25,.25,.25,.25))
+  
+  X[1] <- payoff[1, x[1]]
+  
+  Ev[1,] <- rep(0,4)
+  
+  Ef[1,] <- rep(0,4)
+  
+  PS[1,] <- rep(1,4)
+  
+  for (t in 2:ntrials) {
+    
+    #this is how we "calculate" the 'sign' of the win/loss on the given trial
+    signX[t] <- ifelse(X[t-1]<0,-1,1)
+    
+    for (d in 1:4) {
+      
+      # -------- Updating expected values ------------------------
+      Ev_update[t,d] <- ifelse(X[t-1]>=0,
+                                Ev[t-1,d] + a_rew*((X[t-1]) - Ev[t-1,d]), 
+                                Ev[t-1,d] + a_pun*((X[t-1]) - Ev[t-1,d])
+      )
+                            
+      Ev[t,d] <- ifelse(d==x[t-1],Ev_update[t,d],Ev[t-1,d])
+      
+      # -------- Updating expected frequencies ------------------------
+      #update expected frequencies for ALL decks - AS IF THEY WERE ALL CHOSEN
+      Ef_cho[t,d] <- ifelse(X[t-1]>=0, 
+                              Ef[t-1,d] + a_rew*(signX[t] - Ef[t-1,d]),
+                              Ef[t-1,d] + a_pun*(signX[t] - Ef[t-1,d])
+      )
+      
+      #update expected frequencies for ALL decks - AS IF THEY WERE ALL UNCHOSEN. 
+      Ef_not[t,d] <- ifelse(X[t-1]>=0, 
+                              Ef[t-1,d] + a_pun*(-(signX[t]/3) - Ef[t-1,d]),
+                              Ef[t-1,d] + a_rew*(-(signX[t]/3) - Ef[t-1,d])
+      ) 
+      
+      #copy appropriate values to ef variable
+      Ef[t,d] <- ifelse(d==x[t-1],Ef_cho[t,d],Ef_not[t,d])  
+      
+      #-----------Perseverance----------------------------------
+      #ifelse needed to disctiminate chosen and unchosen decks
+      PS[t,d] <- ifelse(x[t-1]==d,1/(1+K),PS[t-1,d]/(1+K))
+      
+      #-----------Valence model------------------------------
+      V[t,d] <- Ev[t,d] + Ef[t,d]*omega_f + PS[t,d]*omega_p
+      
+      #----------softmax part 1-------------
+      exp_p[t,d] <- exp(theta*V[t,d])
+      
+    }
+    
+    #----------softmax part 2-------------
+    for (d in 1:4) {
+      p[t,d] <- exp_p[t,d]/sum(exp_p[t,])
+    }
+      
+    x[t] <- rcat(1,p[t,])
+    
+    X[t] <- payoff[t,x[t]]
+    
+  }
+  
+  result <- list(x=x,
+                 X=X,
+                 Ev=Ev,
+                 Ef=Ef,
+                 PS=PS,
+                 V=V)
+  
+  return(result)
+  
+  
+  # "turn on" when building
+  #par(mfrow=c(2,2))
+  #plot(Ev[,1])
+  #plot(Ev[,2])
+  #plot(Ev[,3])
+  #plot(Ev[,4])
+  #plot(x)
+}
+
+```
+
+
+```{r, include=FALSE}
+
+plot(x, type = "p", main = "Deck Choices with Reversal Point", xlab = "Trial", ylab = "Deck Choice")
+abline(v = 50, col = "red", lwd = 2, lty = 2)  # Red dashed line at trial 50
+plot(cumsum(X), type = "l", main = "Cumulative Reward Over Trials", xlab = "Trial", ylab = "Cumulative Reward")
+abline(v = 50, col = "blue", lwd = 2, lty = 2)  # Reversal marker
+
+table(x[1:50])  # Before reversal
+table(x[51:100]) # After reversal
+
+```
+
+```{r}
+library(knitr)
+library(kableExtra)
+
+pacman::p_load(kableExtra)
+# Create the table data
+deck_data <- data.frame(
+  Deck = c("Deck A (1)", "Deck B (2)", "Deck C (3)", "Deck D (4)"),
+  `Before Trial 50` = c("Bad Frequent (-250, 100)", 
+                        "Bad Infrequent (-1250, 100)", 
+                        "Good Frequent (-50, 50)", 
+                        "Good Infrequent (-250, 50)"),
+  `After Trial 50 (Switched)` = c("Good Frequent (-50, 50)", 
+                                   "Good Infrequent (-250, 50)", 
+                                   "Bad Frequent (-250, 100)", 
+                                   "Bad Infrequent (-1250, 100)")
+)
+
+# Create and style the table
+kable(deck_data, "html", align = 'c', caption = "Deck Mapping Summary") %>%
+  kable_styling(full_width = F, position = "center", bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  row_spec(0, bold = TRUE, background = "lightgray") %>%
+  column_spec(1:3, border_left = TRUE, border_right = TRUE) %>%
+  kableExtra::scroll_box(width = "100%", height = "300px")
+
+```
+
+
+```{r, echo=FALSE}
+
+##Working starting code !!! - do not change 
+
+install.packages("pacman")
+pacman::p_load(extraDistr,parallel, ggpubr,dplyr, ggplot2, R2jags)
+install.packages("R2jags")
+library(extraDistr)
+library(ggplot2)
+
+
+# Loading the data
+setwd("C:/Users/marti/Desktop/Decision-making Exam/Data") 
+
+datas <- readRDS("Preprocessed/IGT_all_studies.rds")
+
+#View(data)
+
+
+# 1 study 
+single_data <- datas[datas$Study == "Horstmann",] 
+# Check structure
+str(single_data)
+
+# Load the Horstmann dataset
+horstmann_data <- read.csv("/work/MartinMikula#4870/horstmann_data.csv" ,sep = ";", header = TRUE, stringsAsFactors = FALSE)
+
+
+
+```
+
+```{r}
+##Working starting code !!! - do not change 
+### ORL RECOVERY 
+
+#payoff structure 
+#------ create task environment -------------------
+set.seed(2001)
+
+# defining a function for calculating the maximum of the posterior density (not exactly the same as the mode)
+MPD <- function(x) {
+  density(x)$x[which(density(x)$y==max(density(x)$y))]
+}
+
+# --- Define Parameters ---
+ntrials <- 100  # Total number of trials
+nstruct <- 10   # Subdivision size for pseudorandomization
+freq <- 0.5     # Probability of frequent losses
+infreq <- 0.1   # Probability of infrequent losses
+
+# Payoff values
+bad_r <- 100
+bad_freq_l <- -250
+bad_infreq_l <- -1250
+good_r <- 50
+good_freq_l <- -50
+good_infreq_l <- -250
+
+# --- Define Payoff Structures ---
+# Bad Frequent (Deck A)
+A_R <- rep(bad_r, nstruct)
+A_L <- c(rep(bad_freq_l, nstruct*freq), rep(0, nstruct*(1-freq)))
+
+# Bad Infrequent (Deck B)
+B_R <- rep(bad_r, nstruct)
+B_L <- c(rep(bad_infreq_l, nstruct*infreq), rep(0, nstruct*(1-infreq)))
+
+# Good Frequent (Deck C)
+C_R <- rep(good_r, nstruct)
+C_L <- c(rep(good_freq_l, nstruct*freq), rep(0, nstruct*(1-freq)))
+
+# Good Infrequent (Deck D)
+D_R <- rep(good_r, nstruct)
+D_L <- c(rep(good_infreq_l, nstruct*infreq), rep(0, nstruct*(1-infreq)))
+
+# --- Generate Pseudorandomized Payoffs ---
+A <- array(NA, ntrials)
+B <- array(NA, ntrials)
+C <- array(NA, ntrials)
+D <- array(NA, ntrials)
+
+for (i in 1:(ntrials/nstruct)) {
+  start_idx <- (1 + (i-1) * nstruct)
+  end_idx <- i * nstruct
+  
+  A[start_idx:end_idx] <- (A_R + sample(A_L))
+  B[start_idx:end_idx] <- (B_R + sample(B_L))
+  C[start_idx:end_idx] <- (C_R + sample(C_L))
+  D[start_idx:end_idx] <- (D_R + sample(D_L))
+}
+
+# --- Combine Payoffs into Matrix ---
+payoff <- cbind(A, B, C, D)
+
+# --- Swap Payoffs After Trial 50 ---
+payoff[51:100, 1] <- C[51:100]  # A takes C's structure
+payoff[51:100, 2] <- D[51:100]  # B takes D's structure
+payoff[51:100, 3] <- A[51:100]  # C takes A's structure
+payoff[51:100, 4] <- B[51:100]  # D takes B's structure
+# let's look at the payoff
+#colSums(payoff) # the two bad decks should sum to -25 (i.e. -2500), and the two good ones to 25 (i.e. 2500
+
+a_rew <- .3
+a_pun <- .3
+K <- 2
+theta <- 2
+omega_f <- .7
+omega_p <- .7
+
+# ntrials <- 100
+
+# Source your ORL simulation (aka. agent)
+#source("ORL.R")
+
+# Run the simulations
+ORL_sims <- ORL(payoff,ntrials,a_rew,a_pun,K,theta,omega_f,omega_p)
+
+# Plotting to check that simulations make sense
+par(mfrow=c(2,2))
+plot(ORL_sims$Ev[,1])
+plot(ORL_sims$Ev[,2])
+plot(ORL_sims$Ev[,3])
+plot(ORL_sims$Ev[,4])
+
+# Re-assigning sim variables to the corresponding variable names in JAGS
+x <- ORL_sims$x
+X <- ORL_sims$X
+
+# set up jags and run jags model
+# What's our "data"
+data <- list("x","X","ntrials") 
+
+# What's our "parameters"
+params <- c("a_rew","a_pun","K","theta","omega_f","omega_p")
+
+# How to call jags?
+samples <- jags.parallel(data, inits=NULL, params,
+                model.file ="ORL.txt", n.chains=3, 
+                n.iter=5000, n.burnin=1000, n.thin=1, n.cluster=3)
+
+
+###--------------Run full parameter recovery -------------
+# How many iterations?
+niterations <- 5 # fewer because it takes too long
+
+# Which arrays to pre-specify for populating thru the iterations?
+true_a_rew <- array(NA,c(niterations))
+true_a_pun <- array(NA,c(niterations))
+true_K <- array(NA,c(niterations))
+true_theta <- array(NA,c(niterations))
+true_omega_f <- array(NA,c(niterations))
+true_omega_p <- array(NA,c(niterations))
+
+infer_a_rew <- array(NA,c(niterations))
+infer_a_pun <- array(NA,c(niterations))
+infer_K <- array(NA,c(niterations))
+infer_theta <- array(NA,c(niterations))
+infer_omega_f <- array(NA,c(niterations))
+infer_omega_p <- array(NA,c(niterations))
+
+# Let's run the show
+start_time = Sys.time()
+
+for (i in 1:niterations) {
+  
+  # What's our first step on each iteration? (hint: it rhymes with 'diameters')
+  a_rew <- runif(1,0,1)
+  a_pun <- runif(1,0,1)
+  K <- runif(1,0,2)
+  theta <- runif(1,.2,3) # could also just be a set value (e.g. 1) to simplify the model a bit
+  omega_f <- runif(1,-2,2)
+  omega_p <- runif(1,-2,2)
+  
+  # And then? (hint: it's not real data)
+  ORL_sims <- ORL(payoff,ntrials,a_rew,a_pun,K,theta,omega_f,omega_p)
+  
+  # Let's re-assign that into variables that match the corresponding variable names in our JAGS syntax
+  x <- ORL_sims$x
+  X <- ORL_sims$X
+  
+  # Final step? (hint: it rhymes with swags - also, look up - you just did this for 1 run)
+  data <- list("x","X","ntrials") 
+  params<-c("a_rew","a_pun","K","theta","omega_f","omega_p")
+  samples <- jags.parallel(data, inits=NULL, params,
+                  model.file ="ORL.txt", n.chains=3, 
+                  n.iter=3000, n.burnin=1000, n.thin=1, n.cluster=3)
+  
+  # populate the pre-specified arrays
+  true_a_rew[i] <- a_rew
+  true_a_pun[i] <- a_pun
+  true_K[i] <- K
+  true_theta[i] <- theta
+  true_omega_f[i] <- omega_f
+  true_omega_p[i] <- omega_p
+  
+  # some of the values requires finding the maximum a posteriori
+  Y <- samples$BUGSoutput$sims.list
+  infer_a_rew[i] <- MPD(Y$a_rew)
+  infer_a_pun[i] <- MPD(Y$a_pun)
+  infer_K[i] <- MPD(Y$K)
+  infer_theta[i] <- MPD(Y$theta)
+  infer_omega_f[i] <- MPD(Y$omega_f)
+  infer_omega_p[i] <- MPD(Y$omega_p)
+  
+  # Printing "progress"
+  print(i)
+  
+}
+
+# So how long did that take us?
+end_time = Sys.time()
+end_time - start_time
+
+
+
+
+
+```
+```{r}
+# let's look at some scatter plots (adjust variable names if you haven't used exactly the ones I've listed below here)
+
+par(mfrow=c(3,2))
+plot(true_a_rew,infer_a_rew)
+plot(true_a_pun,infer_a_pun)
+plot(true_K,infer_K)
+plot(true_theta,infer_theta)
+plot(true_omega_f,infer_omega_f)
+plot(true_omega_p,infer_omega_p)
+
+# plotting code courtesy of Lasse (again, check that the variable names correspond to yours)
+source('C:/Users/marti/Desktop/Decision-making Exam/Data/recov_plot.R')
+pl1 <- recov_plot(true_a_rew, infer_a_rew, c("true a_rew", "infer a_rew"), 'smoothed linear fit')
+pl2 <- recov_plot(true_a_pun, infer_a_pun, c("true a_pun", "infer a_pun"), 'smoothed linear fit')
+pl3 <- recov_plot(true_K, infer_K, c("true K", "infer K"), 'smoothed linear fit')
+pl4 <- recov_plot(true_theta, infer_theta, c("true theta", "infer theta"), 'smoothed linear fit')
+pl5 <- recov_plot(true_omega_f, infer_omega_f, c("true omega_f", "infer omega_f"), 'smoothed linear fit')
+pl6 <- recov_plot(true_omega_p, infer_omega_p, c("true omega_p", "infer omega_p"), 'smoothed linear fit')
+ggarrange(pl1, pl2, pl3, pl4, pl5, pl6)
+```
+
+
+```{r}
+####ORL.R - actual ORL model simulating decision-amking 
+
+ORL <- function(payoff,ntrials,a_rew,a_pun,K,theta,omega_f,omega_p) {
+
+  # arrays to populate for simulation
+  x <- array(NA,c(ntrials))
+  X <- array(NA,c(ntrials))
+
+  Ev_update <- array(NA,c(ntrials,4))
+  Ev <- array(NA,c(ntrials,4))
+    
+  signX <- array(NA,c(ntrials))
+  Ef_cho <- array(NA,c(ntrials,4))
+  Ef_not <- array(NA,c(ntrials,4))
+  Ef <- array(NA,c(ntrials,4))
+  
+  PS <- array(NA,c(ntrials,4))
+  
+  V <- array(NA,c(ntrials,4))
+  
+  exp_p <- array(NA,c(ntrials,4))
+  p <- array(NA,c(ntrials,4))
+  
+  # free parameters - "turn on" when constructing
+  #a_rew <- .3
+  #a_pun <- .3
+  #K <- 3
+  #theta <- 3
+  #omega_f <- .7
+  #omega_p <- .7
+  
+  x[1] <- rcat(1,c(.25,.25,.25,.25))
+  
+  X[1] <- payoff[1, x[1]]
+  
+  Ev[1,] <- rep(0,4)
+  
+  Ef[1,] <- rep(0,4)
+  
+  PS[1,] <- rep(1,4)
+  
+  for (t in 2:ntrials) {
+    
+    #this is how we "calculate" the 'sign' of the win/loss on the given trial
+    signX[t] <- ifelse(X[t-1]<0,-1,1)
+    
+    for (d in 1:4) {
+      
+      # -------- Updating expected values ------------------------
+      Ev_update[t,d] <- ifelse(X[t-1]>=0,
+                                Ev[t-1,d] + a_rew*((X[t-1]) - Ev[t-1,d]), 
+                                Ev[t-1,d] + a_pun*((X[t-1]) - Ev[t-1,d])
+      )
+                            
+      Ev[t,d] <- ifelse(d==x[t-1],Ev_update[t,d],Ev[t-1,d])
+      
+      # -------- Updating expected frequencies ------------------------
+      #update expected frequencies for ALL decks - AS IF THEY WERE ALL CHOSEN
+      Ef_cho[t,d] <- ifelse(X[t-1]>=0, 
+                              Ef[t-1,d] + a_rew*(signX[t] - Ef[t-1,d]),
+                              Ef[t-1,d] + a_pun*(signX[t] - Ef[t-1,d])
+      )
+      
+      #update expected frequencies for ALL decks - AS IF THEY WERE ALL UNCHOSEN. 
+      Ef_not[t,d] <- ifelse(X[t-1]>=0, 
+                              Ef[t-1,d] + a_pun*(-(signX[t]/3) - Ef[t-1,d]),
+                              Ef[t-1,d] + a_rew*(-(signX[t]/3) - Ef[t-1,d])
+      ) 
+      
+      #copy appropriate values to ef variable
+      Ef[t,d] <- ifelse(d==x[t-1],Ef_cho[t,d],Ef_not[t,d])  
+      
+      #-----------Perseverance----------------------------------
+      #ifelse needed to disctiminate chosen and unchosen decks
+      PS[t,d] <- ifelse(x[t-1]==d,1/(1+K),PS[t-1,d]/(1+K))
+      
+      #-----------Valence model------------------------------
+      V[t,d] <- Ev[t,d] + Ef[t,d]*omega_f + PS[t,d]*omega_p
+      
+      #----------softmax part 1-------------
+      exp_p[t,d] <- exp(theta*V[t,d])
+      
+    }
+    
+    #----------softmax part 2-------------
+    for (d in 1:4) {
+      p[t,d] <- exp_p[t,d]/sum(exp_p[t,])
+    }
+      
+    x[t] <- rcat(1,p[t,])
+    
+    X[t] <- payoff[t,x[t]]
+    
+  }
+  
+  result <- list(x=x,
+                 X=X,
+                 Ev=Ev,
+                 Ef=Ef,
+                 PS=PS,
+                 V=V)
+  
+  return(result)
+  
+  
+  # "turn on" when building
+  #par(mfrow=c(2,2))
+  #plot(Ev[,1])
+  #plot(Ev[,2])
+  #plot(Ev[,3])
+  #plot(Ev[,4])
+  #plot(x)
+}
+
+
+
+```
+```{r}
+plot(x, type = "p", main = "Deck Choices with Reversal Point", xlab = "Trial", ylab = "Deck Choice")
+abline(v = 50, col = "red", lwd = 2, lty = 2)  # Red dashed line at trial 50
+plot(cumsum(X), type = "l", main = "Cumulative Reward Over Trials", xlab = "Trial", ylab = "Cumulative Reward")
+abline(v = 50, col = "blue", lwd = 2, lty = 2)  # Reversal marker
+
+table(x[1:50])  # Before reversal
+table(x[51:100]) # After reversal
+```
+
